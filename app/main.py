@@ -1,11 +1,15 @@
 import json
 import os
-import sys
 import time
 import random
 from datetime import datetime, timezone
 from urllib.parse import urljoin
 from confluent_kafka import Producer
+import logging, sys
+
+logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+logger = logging.getLogger(__name__)
+
 
 def _create_producer(bootstrap_servers: str) -> "Producer":
     conf = {
@@ -14,6 +18,9 @@ def _create_producer(bootstrap_servers: str) -> "Producer":
         "enable.idempotence": True,
         "acks": "all",
     }
+    debug_flags = os.getenv("KAFKA_DEBUG")
+    if debug_flags:
+        conf["debug"] = debug_flags
     return Producer(conf)
 
 
@@ -23,11 +30,11 @@ def _send_random_batch(
     count: int,
 ) -> None:
     errors: list[str] = []
-    base_url = os.getenv("CRAWL_BASE_URL")
+    base_url = os.getenv("CRAWL_BASE_URL", "http://localhost:8000")
     endpoints = {
-        "social": "/social/posts",
-        "bank": "/bank/transactions",
-        "ecommerce": "/ecommerce/history",
+        "social": "/crawl/social/posts?count=10",
+        "bank": "/crawl/bank/transactions?count=10",
+        "ecommerce": "/crawl/ecommerce/history?count=10",
     }
 
     domains_env = os.getenv("CRAWL_DOMAINS", "bank,social,ecommerce")
@@ -38,7 +45,6 @@ def _send_random_batch(
     def _delivery(err, _msg) -> None:
         if err is not None:
             errors.append(str(err))
-
     for _ in range(count):
         logical = random.choice(logical_domains)
         topic_for_domain = (
@@ -57,11 +63,11 @@ def _send_random_batch(
 
         key_bytes = logical.encode()
         val_bytes = json.dumps(payload, separators=(",", ":")).encode()
-        print(logical, "==========>", json.dumps(payload, separators=(",", ":")))
         producer.produce(
             topic=topic_for_domain,
             key=key_bytes,
             value=val_bytes,
+            headers=[("group_id", (topic_for_domain or "").encode())],
             on_delivery=_delivery,
         )
         producer.poll(0)
@@ -72,34 +78,41 @@ def _send_random_batch(
 
 
 def main() -> None:
-    bootstrap = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
-    topic_bank = os.getenv("CRAWL_TOPIC_BANK", "crawl_bank")
-    topic_social = os.getenv("CRAWL_TOPIC_SOCIAL", "crawl_social")
-    topic_ecom = os.getenv("CRAWL_TOPIC_ECOM", "crawl_ecom")
+    bootstrap = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+    group_topic = os.getenv("CRAWL_TOPIC_GROUP", "crawl_group")
     topics_by_domain = {
-        "bank": topic_bank,
-        "social": topic_social,
-        "ecom": topic_ecom,
+        "bank": group_topic,
+        "social": group_topic,
+        "ecom": group_topic,
     }
-
     try:
         producer = _create_producer(bootstrap)
+    except Exception as exc:
+        raise RuntimeError(f"Cant create producre {exc.__repr__()}")
+
+    try:
+
+        batch_size = 20
+        logger.info(
+            f"Producer starting. bootstrap={bootstrap} group_topic={group_topic} batch_size={batch_size}"
+        )
         while True:
             _send_random_batch(
                 producer,
                 topics_by_domain=topics_by_domain,
-                count=100,
+                count=batch_size,
             )
-            print("Batch sent: 100 messages across domain topics")
-            time.sleep(2)
+            logger.info(f"Batch sent: {batch_size} messages to group topic: {group_topic}")
+            time.sleep(60)
+
     except KeyboardInterrupt:
         try:
             producer.flush()
         except Exception:
             pass
-        print("Interrupted by user. Exiting.")
+        logger.info("Interrupted by user. Exiting.")
     except Exception as exc:
-        print(f"Failed to send crawl tasks: {exc}", file=sys.stderr)
+        logger.info(f"Failed to send crawl tasks: {exc.__repr__()}")
         sys.exit(1)
 
 if __name__ == "__main__":
